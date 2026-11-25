@@ -139,6 +139,7 @@ import {
   advanceHydrationNode,
   claimAnchor,
   cleanupHydrationTail,
+  collectHydratingRoots,
   currentHydrationNode,
   enterComponentRange,
   enterHydrationCursor,
@@ -410,7 +411,7 @@ export function createComponent(
 
   const _insertionParent = insertionParent
   const _insertionAnchor = insertionAnchor
-  let hydration: ComponentHydration | null = null
+  let hydration: ComponentRange | null = null
   let pendingAsyncHydration = false
   if (isHydrating) {
     // a vdom component, or a runtime wrapper of a user component: a range
@@ -621,6 +622,7 @@ export function createComponent(
       appContext,
       ce,
     )
+    if (hydration) hydration.instance = instance
     if (key !== undefined) instance.$key = key
     if (inputScope) {
       instance.inputScope = inputScope
@@ -756,12 +758,6 @@ export function createComponent(
   }
 }
 
-interface ComponentHydration extends ComponentRange {
-  cursor: HydrationCursor
-  /** renders in the range the component around it claimed */
-  shared: boolean
-}
-
 /**
  * Open a component's SSR range. The server renders several roots, or a sole
  * root that opens a range itself, in a range, `<!--[$-->`, and any other
@@ -775,7 +771,7 @@ function enterComponentHydration(
   claims: boolean,
   single: boolean,
   wraps: boolean,
-): ComponentHydration {
+): ComponentRange {
   const cursor = enterHydrationCursor()
   const start = cursor.start
   let close: Node | null = null
@@ -790,7 +786,7 @@ function enterComponentHydration(
       unit = start
     }
   }
-  const hydration: ComponentHydration = {
+  const hydration: ComponentRange = {
     cursor,
     close,
     unit,
@@ -798,6 +794,7 @@ function enterComponentHydration(
     depth: 0,
     prev: null,
     shared,
+    instance: null,
   }
   enterComponentRange(hydration)
   return hydration
@@ -820,7 +817,7 @@ function wrapsComponent(component: VaporComponent): boolean {
  * range is trimmed first and the cursor moves past the close marker.
  */
 function exitComponentHydration(
-  hydration: ComponentHydration,
+  hydration: ComponentRange,
   finalizeBoundary: boolean,
 ): void {
   exitComponentRange(hydration)
@@ -1339,12 +1336,37 @@ export class VaporComponentInstance<
     const vnode = isInteropEnabled && this.interopVNode
     return Object.keys(vnode ? vnode.props || EMPTY_OBJ : this.rawValues)
   }
+
+  // Read by useInstanceInfo. `block` is not set while the block fn runs.
+  rootEls(roots: Element[]): void {
+    if (this.block) collectRootElements(this.block, roots)
+    else if (isHydrating) collectHydratingRoots(this, roots)
+  }
+
+  hydrating(): boolean {
+    return isHydrating && !this.isMounted
+  }
 }
 
 export function isVaporComponent(
   value: unknown,
 ): value is VaporComponentInstance {
   return value instanceof VaporComponentInstance
+}
+
+function collectRootElements(block: Block, roots: Element[]): void {
+  if (block instanceof Element) {
+    roots.push(block)
+  } else if (isVaporComponent(block)) {
+    collectRootElements(block.block, roots)
+  } else if (isArray(block)) {
+    for (let i = 0; i < block.length; i++) collectRootElements(block[i], roots)
+  } else if (
+    isFragment(block) &&
+    !(isTeleportEnabled && isTeleportFragment(block))
+  ) {
+    collectRootElements(block.nodes, roots)
+  }
 }
 
 /**
@@ -1633,6 +1655,7 @@ export function mountComponent(
         // resolves. Restore only its active state; KeepAlive activation requires
         // a mounted block.
         instance.isDeactivated = false
+        if (instance.inputScope) instance.inputScope.resume()
       }
       return
     }
@@ -1683,6 +1706,7 @@ export function mountComponent(
             getBlockFirstNode(pendingBlock)!,
             () => {
               const hydration = enterComponentHydration(true, false, false)
+              hydration.instance = instance
               try {
                 withDeferredHydrationBoundary(renderAndMount)
               } finally {
